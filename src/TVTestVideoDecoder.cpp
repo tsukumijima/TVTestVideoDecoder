@@ -1,6 +1,6 @@
 /*
  *  TVTest DTV Video Decoder
- *  Copyright (C) 2015-2018 DBCTRADO
+ *  Copyright (C) 2015-2022 DBCTRADO
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -27,6 +27,7 @@
 #include "TVTestVideoDecoderStat.h"
 #include "PixelFormatConvert.h"
 #include "Mpeg2DecoderDXVA2.h"
+#include "Mpeg2DecoderD3D11.h"
 #include "Util.h"
 #include "Common.h"
 #include "MediaTypes.h"
@@ -44,6 +45,7 @@
 #define KEY_Saturation        L"Saturation"
 #define KEY_NumThreads        L"NumThreads"
 #define KEY_EnableDXVA2       L"EnableDXVA2"
+#define KEY_EnableD3D11       L"EnableD3D11"
 
 
 static bool RegReadDWORD(HKEY hKey, LPCTSTR pszName, DWORD *pValue)
@@ -76,9 +78,12 @@ CTVTestVideoDecoder::CTVTestVideoDecoder(LPUNKNOWN lpunk, HRESULT* phr, bool fLo
 	, m_FrameCount(0)
 	, m_RateChange({0, 10000})
 	, m_fLocalInstance(fLocal)
+	, m_fForceSoftwareDecoder(false)
+	, m_fReInitDecoder(false)
 	, m_Statistics()
 
 	, m_fDXVA2Decode(false)
+	, m_fD3D11Decode(false)
 	, m_fEnableDeinterlace(true)
 	, m_DeinterlaceMethod(TVTVIDEODEC_DEINTERLACE_BLEND)
 	, m_fAdaptProgressive(true)
@@ -90,6 +95,7 @@ CTVTestVideoDecoder::CTVTestVideoDecoder(LPUNKNOWN lpunk, HRESULT* phr, bool fLo
 	, m_Hue(0)
 	, m_Saturation(0)
 	, m_NumThreads(0)
+	, m_NumQueueFrames(CMpeg2DecoderD3D11::DEFAULT_QUEUE_FRAMES)
 	, m_fCrop1088To1080(true)
 {
 	if (FAILED(*phr)) {
@@ -129,6 +135,8 @@ STDMETHODIMP CTVTestVideoDecoder::NonDelegatingQueryInterface(REFIID riid, void 
 {
 	if (riid == __uuidof(ITVTestVideoDecoder))
 		return GetInterface(static_cast<ITVTestVideoDecoder*>(this), ppv);
+	if (riid == __uuidof(ITVTestVideoDecoder2))
+		return GetInterface(static_cast<ITVTestVideoDecoder2*>(this), ppv);
 	if (riid == __uuidof(ISpecifyPropertyPages))
 		return GetInterface(static_cast<ISpecifyPropertyPages*>(this), ppv);
 	if (riid == __uuidof(ISpecifyPropertyPages2))
@@ -141,6 +149,7 @@ HRESULT CTVTestVideoDecoder::EndOfStream()
 {
 	DBG_TRACE(TEXT("EndOfStream()"));
 	CAutoLock Lock(&m_csReceive);
+	FlushFrameQueue();
 	return __super::EndOfStream();
 }
 
@@ -153,6 +162,7 @@ HRESULT CTVTestVideoDecoder::BeginFlush()
 HRESULT CTVTestVideoDecoder::EndFlush()
 {
 	DBG_TRACE(TEXT("EndFlush()"));
+	ClearFrameQueue();
 	return __super::EndFlush();
 }
 
@@ -196,10 +206,41 @@ HRESULT CTVTestVideoDecoder::InitDecode(bool fPutSequenceHeader)
 		} else {
 			pDXVADecoder->ResetDecoding();
 		}
+	} else {
+		CMpeg2DecoderD3D11 *pD3D11Decoder = dynamic_cast<CMpeg2DecoderD3D11 *>(m_pDecoder);
+		if (pD3D11Decoder) {
+			HRESULT hr = S_OK;
+			if (m_fReInitDecoder) {
+				pD3D11Decoder->CloseDevice();
+			}
+			if (!pD3D11Decoder->IsDeviceCreated()) {
+				hr = pD3D11Decoder->CreateDevice(this);
+			}
+			if (SUCCEEDED(hr)) {
+				if (!pD3D11Decoder->IsDecoderCreated()) {
+					hr = pD3D11Decoder->CreateDecoder();
+				} else {
+					pD3D11Decoder->ResetDecoding();
+				}
+			}
+			if (FAILED(hr)) {
+				DBG_TRACE(TEXT("Fallback to software decoder"));
+				SafeDelete(m_pDecoder);
+				m_fForceSoftwareDecoder = true;
+			}
+		}
 	}
 
+	m_fReInitDecoder = false;
+
 	if (!m_pDecoder) {
-		m_pDecoder = DNew_nothrow CMpeg2Decoder;
+		if (m_fD3D11Decode && !m_fForceSoftwareDecoder) {
+			CMpeg2DecoderD3D11 *pDecoder = DNew_nothrow CMpeg2DecoderD3D11;
+			pDecoder->SetFrameQueueSize(m_NumQueueFrames);
+			m_pDecoder = pDecoder;
+		} else {
+			m_pDecoder = DNew_nothrow CMpeg2Decoder;
+		}
 		if (!m_pDecoder) {
 			return E_OUTOFMEMORY;
 		}
@@ -246,6 +287,36 @@ HRESULT CTVTestVideoDecoder::InitDecode(bool fPutSequenceHeader)
 	InitDeinterlacers();
 
 	return S_OK;
+}
+
+HRESULT CTVTestVideoDecoder::FlushFrameQueue()
+{
+	CMpeg2DecoderD3D11 *pD3D11Decoder = dynamic_cast<CMpeg2DecoderD3D11 *>(m_pDecoder);
+	if (pD3D11Decoder) {
+		for (;;) {
+			CFrameBuffer Frame;
+			HRESULT hr = pD3D11Decoder->GetQueuedFrame(&Frame);
+			if (hr == S_OK) {
+				hr = DeliverFrame(&Frame);
+				pD3D11Decoder->UnlockFrame(&Frame);
+				if (FAILED(hr)) {
+					return hr;
+				}
+			}
+		}
+
+		pD3D11Decoder->ClearFrameQueue();
+	}
+
+	return S_OK;
+}
+
+void CTVTestVideoDecoder::ClearFrameQueue()
+{
+	CMpeg2DecoderD3D11 *pD3D11Decoder = dynamic_cast<CMpeg2DecoderD3D11 *>(m_pDecoder);
+	if (pD3D11Decoder) {
+		pD3D11Decoder->ClearFrameQueue();
+	}
 }
 
 void CTVTestVideoDecoder::SetFrameStatus()
@@ -502,7 +573,7 @@ HRESULT CTVTestVideoDecoder::Transform(IMediaSample *pIn)
 {
 	HRESULT hr;
 
-	if (!m_pDecoder || pIn->IsDiscontinuity() == S_OK) {
+	if (!m_pDecoder || m_fReInitDecoder || pIn->IsDiscontinuity() == S_OK) {
 		hr = InitDecode(false);
 		if (FAILED(hr)) {
 			return hr;
@@ -596,6 +667,7 @@ HRESULT CTVTestVideoDecoder::Transform(IMediaSample *pIn)
 					&& pInfo->sequence->width == pInfo->sequence->chroma_width * 2
 					&& pInfo->sequence->height == pInfo->sequence->chroma_height * 2) {
 				const mpeg2_picture_t *picture = pInfo->display_picture;
+				CMpeg2DecoderD3D11 *pD3D11Decoder = dynamic_cast<CMpeg2DecoderD3D11 *>(m_pDecoder);
 
 				if (picture) {
 					int Width = pInfo->sequence->picture_width;
@@ -605,7 +677,7 @@ HRESULT CTVTestVideoDecoder::Transform(IMediaSample *pIn)
 						Height = 1080;
 					}
 					if (m_FrameBuffer.m_Width != Width || m_FrameBuffer.m_Height != Height) {
-						m_FrameBuffer.Allocate(Width, Height);
+						m_FrameBuffer.Allocate(Width, Height, pD3D11Decoder != nullptr ? MEDIASUBTYPE_NV12 : MEDIASUBTYPE_I420);
 					}
 
 					m_pDecoder->GetAspectRatio(&m_FrameBuffer.m_AspectX, &m_FrameBuffer.m_AspectY);
@@ -669,8 +741,35 @@ HRESULT CTVTestVideoDecoder::Transform(IMediaSample *pIn)
 						DBG_ERROR(TEXT("DecodeFrame() failed (%x)"), hr);
 					}
 #endif
+				} else if (pD3D11Decoder) {
+					CFrameBuffer Buffer;
+					Buffer.CopyAttributesFrom(&m_FrameBuffer);
+					hr = pD3D11Decoder->DecodeFrame(&Buffer);
+					if (hr == S_OK && Buffer.m_Buffer[0]) {
+						if (Buffer.m_Width >= m_FrameBuffer.m_Width && Buffer.m_Height >= m_FrameBuffer.m_Height) {
+							Buffer.m_Width = m_FrameBuffer.m_Width;
+							Buffer.m_Height = m_FrameBuffer.m_Height;
+						}
+
+						hr = DeliverFrame(&Buffer);
+						pD3D11Decoder->UnlockFrame(&Buffer);
+						if (FAILED(hr)) {
+							DBG_ERROR(TEXT("DeliverFrame() failed (%x)"), hr);
+							return hr;
+						}
+					} else if (pD3D11Decoder->IsDeviceLost()) {
+						m_fReInitDecoder = true;
+						break;
+					}
 				} else if (picture && !(picture->flags & PIC_FLAG_SKIP)) {
-					hr = DeliverFrame(&m_FrameBuffer);
+					CFrameBuffer Buffer;
+
+					if (!m_pDecoder->GetFrame(&Buffer)) {
+						return S_FALSE;
+					}
+					Buffer.CopyAttributesFrom(&m_FrameBuffer);
+
+					hr = DeliverFrame(&Buffer);
 					if (FAILED(hr)) {
 						DBG_ERROR(TEXT("DeliverFrame() failed (%x)"), hr);
 						return hr;
@@ -689,7 +788,7 @@ HRESULT CTVTestVideoDecoder::Transform(IMediaSample *pIn)
 	return S_OK;
 }
 
-HRESULT CTVTestVideoDecoder::DeliverFrame(CFrameBuffer *pFrameBuffer)
+HRESULT CTVTestVideoDecoder::DeliverFrame(const CFrameBuffer *pFrameBuffer)
 {
 	HRESULT hr;
 	CDeinterlacer *pDeinterlacer;
@@ -711,16 +810,9 @@ HRESULT CTVTestVideoDecoder::DeliverFrame(CFrameBuffer *pFrameBuffer)
 		return hr;
 	}
 
-	CFrameBuffer SrcBuffer, DstBuffer;
+	CFrameBuffer DstBuffer;
 
-	SrcBuffer.CopyAttributesFrom(pFrameBuffer);
-
-	if (!m_pDecoder->GetFrame(&SrcBuffer)) {
-		pOutSample->Release();
-		return S_FALSE;
-	}
-
-	pFrameBuffer->CopyReferenceTo(&DstBuffer);
+	DstBuffer.CopyAttributesFrom(pFrameBuffer);
 
 	hr = SetupOutputFrameBuffer(&DstBuffer, pOutSample, pDeinterlacer);
 	if (FAILED(hr)) {
@@ -728,84 +820,122 @@ HRESULT CTVTestVideoDecoder::DeliverFrame(CFrameBuffer *pFrameBuffer)
 		return hr;
 	}
 
-	if (DstBuffer.m_pSurface) {
+	if (DstBuffer.m_pD3D9Surface) {
 		D3DSURFACE_DESC desc;
-		hr = DstBuffer.m_pSurface->GetDesc(&desc);
+		hr = DstBuffer.m_pD3D9Surface->GetDesc(&desc);
 		if (SUCCEEDED(hr)) {
 			if ((desc.Format != D3DFMT_NV12 && desc.Format != D3DFMT_IMC3)
-					|| (int)desc.Width < SrcBuffer.m_Width
-					|| (int)desc.Height < SrcBuffer.m_Height) {
+					|| (int)desc.Width < pFrameBuffer->m_Width
+					|| (int)desc.Height < pFrameBuffer->m_Height) {
 				hr = E_FAIL;
 			} else {
 				D3DLOCKED_RECT rect;
-				hr = DstBuffer.m_pSurface->LockRect(&rect, nullptr, D3DLOCK_DISCARD | D3DLOCK_NOSYSLOCK);
+				hr = DstBuffer.m_pD3D9Surface->LockRect(&rect, nullptr, D3DLOCK_DISCARD | D3DLOCK_NOSYSLOCK);
 				if (SUCCEEDED(hr)) {
 					if (desc.Format == D3DFMT_NV12) {
 						PixelCopyI420ToNV12(
-							SrcBuffer.m_Width, SrcBuffer.m_Height,
+							pFrameBuffer->m_Width, pFrameBuffer->m_Height,
 							(uint8_t*)rect.pBits, (uint8_t*)rect.pBits + desc.Height * rect.Pitch, rect.Pitch,
-							SrcBuffer.m_Buffer[0], SrcBuffer.m_Buffer[1], SrcBuffer.m_Buffer[2],
-							SrcBuffer.m_PitchY, SrcBuffer.m_PitchC);
+							pFrameBuffer->m_Buffer[0], pFrameBuffer->m_Buffer[1], pFrameBuffer->m_Buffer[2],
+							pFrameBuffer->m_PitchY, pFrameBuffer->m_PitchC);
 					} else if (desc.Format == D3DFMT_IMC3) {
 						PixelCopyI420ToI420(
-							SrcBuffer.m_Width, SrcBuffer.m_Height,
+							pFrameBuffer->m_Width, pFrameBuffer->m_Height,
 							(uint8_t*)rect.pBits,
 							(uint8_t*)rect.pBits + ((desc.Height + 15) & ~15) * rect.Pitch,
 							(uint8_t*)rect.pBits + (((desc.Height + (desc.Height / 2)) + 15) & ~15) * rect.Pitch,
 							rect.Pitch, rect.Pitch,
-							SrcBuffer.m_Buffer[0], SrcBuffer.m_Buffer[1], SrcBuffer.m_Buffer[2],
-							SrcBuffer.m_PitchY, SrcBuffer.m_PitchC);
+							pFrameBuffer->m_Buffer[0], pFrameBuffer->m_Buffer[1], pFrameBuffer->m_Buffer[2],
+							pFrameBuffer->m_PitchY, pFrameBuffer->m_PitchC);
 					}
-					DstBuffer.m_pSurface->UnlockRect();
+					DstBuffer.m_pD3D9Surface->UnlockRect();
 					hr = Deliver(pOutSample, &DstBuffer);
 				}
 			}
 		}
-		SafeRelease(DstBuffer.m_pSurface);
+		SafeRelease(DstBuffer.m_pD3D9Surface);
 		pOutSample->Release();
 		return hr;
+	}
+
+	const CFrameBuffer *pSrcBuffer = pFrameBuffer;
+	CFrameBuffer *pDstBuffer = &DstBuffer;
+
+	if (!DstBuffer.m_Buffer[0]) {
+		GUID Subtype;
+
+		if (pDeinterlacer->IsFormatSupported(pFrameBuffer->m_Subtype, pFrameBuffer->m_Subtype)) {
+			Subtype = pFrameBuffer->m_Subtype;
+		} else {
+			Subtype = MEDIASUBTYPE_I420;
+		}
+
+		if (pFrameBuffer->m_Subtype != Subtype) {
+			CFrameBuffer *pTempBuffer = &m_DeinterlaceTempBuffer[0];
+
+			if (!pTempBuffer->m_pBuffer
+					|| pTempBuffer->m_Subtype != Subtype
+					|| pTempBuffer->m_Width != pFrameBuffer->m_Width
+					|| pTempBuffer->m_Height != pFrameBuffer->m_Height) {
+				if (!pTempBuffer->Allocate(pFrameBuffer->m_Width, pFrameBuffer->m_Height, Subtype)) {
+					pOutSample->Release();
+					return E_OUTOFMEMORY;
+				}
+			}
+			pTempBuffer->CopyAttributesFrom(pFrameBuffer);
+			pTempBuffer->CopyPixelsFrom(pFrameBuffer);
+			pSrcBuffer = pTempBuffer;
+		}
+
+		pDstBuffer = &m_DeinterlaceTempBuffer[1];
+		if (!pDstBuffer->m_pBuffer
+				|| pDstBuffer->m_Subtype != Subtype
+				|| pDstBuffer->m_Width != pFrameBuffer->m_Width
+				|| pDstBuffer->m_Height != pFrameBuffer->m_Height) {
+			if (!pDstBuffer->Allocate(pFrameBuffer->m_Width, pFrameBuffer->m_Height, Subtype)) {
+				pOutSample->Release();
+				return E_OUTOFMEMORY;
+			}
+		}
+		pDstBuffer->CopyAttributesFrom(pFrameBuffer);
 	}
 
 	const bool fTopFieldFirst = !!(pFrameBuffer->m_Flags & FRAME_FLAG_TOP_FIELD_FIRST);
 	CDeinterlacer::FrameStatus FrameStatus;
 	REFERENCE_TIME rtStop = INVALID_TIME;
 
-	FrameStatus = pDeinterlacer->GetFrame(&DstBuffer, &SrcBuffer, fTopFieldFirst, 0);
+	FrameStatus = pDeinterlacer->GetFrame(pDstBuffer, pSrcBuffer, fTopFieldFirst, 0);
 	if (FrameStatus == CDeinterlacer::FRAME_SKIP) {
-		FrameStatus = m_Deinterlacer_Blend.GetFrame(&DstBuffer, &SrcBuffer, fTopFieldFirst, 0);
+		FrameStatus = m_Deinterlacer_Blend.GetFrame(pDstBuffer, pSrcBuffer, fTopFieldFirst, 0);
 	}
 	if (FrameStatus == CDeinterlacer::FRAME_OK) {
 		if (pDeinterlacer->IsDoubleFrame()) {
-			if (DstBuffer.m_rtStart >= 0 && DstBuffer.m_rtStop >= 0) {
-				rtStop = DstBuffer.m_rtStop;
-				DstBuffer.m_rtStop = (DstBuffer.m_rtStart + DstBuffer.m_rtStop) / 2;
+			if (pDstBuffer->m_rtStart >= 0 && pDstBuffer->m_rtStop >= 0) {
+				rtStop = pDstBuffer->m_rtStop;
+				pDstBuffer->m_rtStop = (pDstBuffer->m_rtStart + pDstBuffer->m_rtStop) / 2;
 			}
 		}
 
-		hr = Deliver(pOutSample, &DstBuffer);
+		hr = Deliver(pOutSample, pDstBuffer);
 		if (FAILED(hr)) {
 			goto DeliverEnd;
 		}
 	}
 
-	pDeinterlacer->FramePostProcess(&DstBuffer, &SrcBuffer, fTopFieldFirst);
+	pDeinterlacer->FramePostProcess(pDstBuffer, pSrcBuffer, fTopFieldFirst);
 
 	if (pDeinterlacer->IsDoubleFrame()) {
-		FrameStatus = pDeinterlacer->GetFrame(&DstBuffer, &SrcBuffer, !fTopFieldFirst, 1);
+		FrameStatus = pDeinterlacer->GetFrame(pDstBuffer, pSrcBuffer, !fTopFieldFirst, 1);
 		if (FrameStatus == CDeinterlacer::FRAME_OK) {
 			if (rtStop >= 0) {
-				DstBuffer.m_rtStart = DstBuffer.m_rtStop;
-				DstBuffer.m_rtStop = rtStop;
+				pDstBuffer->m_rtStart = pDstBuffer->m_rtStop;
+				pDstBuffer->m_rtStop = rtStop;
 			}
 
-			SafeRelease(DstBuffer.m_pSurface);
-			pOutSample->Release();
+			SafeRelease(pOutSample);
 			hr = GetDeliveryBuffer(&pOutSample);
 			if (SUCCEEDED(hr)) {
-				hr = SetupOutputFrameBuffer(&DstBuffer, pOutSample, pDeinterlacer);
-				if (SUCCEEDED(hr)) {
-					hr = Deliver(pOutSample, &DstBuffer);
-				}
+				hr = Deliver(pOutSample, pDstBuffer);
 			}
 		}
 	}
@@ -932,7 +1062,7 @@ HRESULT CTVTestVideoDecoder::SetupOutputFrameBuffer(
 			IDirect3DSurface9 *pSurface;
 			hr = pMFGetService->GetService(MR_BUFFER_SERVICE, IID_PPV_ARGS(&pSurface));
 			if (SUCCEEDED(hr)) {
-				pFrameBuffer->m_pSurface = pSurface;
+				pFrameBuffer->m_pD3D9Surface = pSurface;
 			}
 			pMFGetService->Release();
 		}
@@ -940,9 +1070,8 @@ HRESULT CTVTestVideoDecoder::SetupOutputFrameBuffer(
 		const CMediaType &mt = m_pOutput->CurrentMediaType();
 
 		if (!pDeinterlacer->IsRetainFrame()
-				&& pDeinterlacer->IsFormatSupported(pFrameBuffer->m_Subtype, mt.subtype)
-				&& !m_ColorAdjustment.IsEffective()
-				&& !m_FrameCapture.IsEnabled()) {
+				&& !pDeinterlacer->IsDoubleFrame()
+				&& pDeinterlacer->IsFormatSupported(pFrameBuffer->m_Subtype, mt.subtype)) {
 			BITMAPINFOHEADER bmihOut;
 			BYTE *pOutData;
 
@@ -1034,6 +1163,11 @@ HRESULT CTVTestVideoDecoder::CompleteConnect(PIN_DIRECTION direction, IPin *pRec
 		if (m_fDXVA2Decode) {
 			m_pDecoder = DNew_nothrow CMpeg2DecoderDXVA2;
 			m_cBuffers = 8;
+		} else if (m_fD3D11Decode && !m_fForceSoftwareDecoder) {
+			CMpeg2DecoderD3D11 *pDecoder = DNew_nothrow CMpeg2DecoderD3D11;
+			pDecoder->SetFrameQueueSize(m_NumQueueFrames);
+			m_pDecoder = pDecoder;
+			m_cBuffers = 1;
 		} else {
 			m_pDecoder = DNew_nothrow CMpeg2Decoder;
 			m_cBuffers = 1;
@@ -1335,6 +1469,8 @@ STDMETHODIMP CTVTestVideoDecoder::LoadOptions()
 		SetNumThreads((int)Value);
 	if (RegReadDWORD(hKey, KEY_EnableDXVA2, &Value))
 		SetEnableDXVA2(Value != 0);
+	if (RegReadDWORD(hKey, KEY_EnableD3D11, &Value))
+		SetEnableD3D11(Value != 0);
 
 	::RegCloseKey(hKey);
 
@@ -1369,6 +1505,7 @@ STDMETHODIMP CTVTestVideoDecoder::SaveOptions()
 	RegWriteDWORD(hKey, KEY_Saturation, (DWORD)m_Saturation);
 	RegWriteDWORD(hKey, KEY_NumThreads, (DWORD)m_NumThreads);
 	RegWriteDWORD(hKey, KEY_EnableDXVA2, m_fDXVA2Decode);
+	RegWriteDWORD(hKey, KEY_EnableD3D11, m_fD3D11Decode);
 
 	::RegCloseKey(hKey);
 
@@ -1410,26 +1547,39 @@ STDMETHODIMP CTVTestVideoDecoder::GetStatistics(TVTVIDEODEC_Statistics *pStatist
 	}
 
 	if (Mask & TVTVIDEODEC_STAT_MODE) {
-		pStatistics->Mode = m_fDXVAOutput ? TVTVIDEODEC_MODE_DXVA2 : 0;
+		pStatistics->Mode = 0;
+		if (m_fDXVAOutput)
+			pStatistics->Mode |= TVTVIDEODEC_MODE_DXVA2;
+		if (dynamic_cast<CMpeg2DecoderD3D11 *>(m_pDecoder))
+			pStatistics->Mode |= TVTVIDEODEC_MODE_D3D11;
 	}
 
-	if (Mask & TVTVIDEODEC_STAT_DXVA_DEVICE_INFO) {
+	if (Mask & TVTVIDEODEC_STAT_HARDWARE_DECODER_INFO) {
+		::ZeroMemory(&pStatistics->HardwareDecoderInfo, sizeof(pStatistics->HardwareDecoderInfo));
 		const CMpeg2DecoderDXVA2 *pDXVADecoder = dynamic_cast<const CMpeg2DecoderDXVA2 *>(m_pDecoder);
 		if (pDXVADecoder) {
 			const D3DADAPTER_IDENTIFIER9 &AdapterID = pDXVADecoder->GetAdapterIdentifier();
 			::MultiByteToWideChar(CP_ACP, 0, AdapterID.Description, -1,
-				pStatistics->DXVADeviceInfo.Description,
-				_countof(pStatistics->DXVADeviceInfo.Description));
-			pStatistics->DXVADeviceInfo.Product     = HIWORD(AdapterID.DriverVersion.HighPart);
-			pStatistics->DXVADeviceInfo.Version     = LOWORD(AdapterID.DriverVersion.HighPart);
-			pStatistics->DXVADeviceInfo.SubVersion  = HIWORD(AdapterID.DriverVersion.LowPart);
-			pStatistics->DXVADeviceInfo.Build       = LOWORD(AdapterID.DriverVersion.LowPart);
-			pStatistics->DXVADeviceInfo.VendorID    = AdapterID.VendorId;
-			pStatistics->DXVADeviceInfo.DeviceID    = AdapterID.DeviceId;
-			pStatistics->DXVADeviceInfo.SubSystemID = AdapterID.SubSysId;
-			pStatistics->DXVADeviceInfo.Revision    = AdapterID.Revision;
+				pStatistics->HardwareDecoderInfo.Description,
+				_countof(pStatistics->HardwareDecoderInfo.Description));
+			pStatistics->HardwareDecoderInfo.Product     = HIWORD(AdapterID.DriverVersion.HighPart);
+			pStatistics->HardwareDecoderInfo.Version     = LOWORD(AdapterID.DriverVersion.HighPart);
+			pStatistics->HardwareDecoderInfo.SubVersion  = HIWORD(AdapterID.DriverVersion.LowPart);
+			pStatistics->HardwareDecoderInfo.Build       = LOWORD(AdapterID.DriverVersion.LowPart);
+			pStatistics->HardwareDecoderInfo.VendorID    = AdapterID.VendorId;
+			pStatistics->HardwareDecoderInfo.DeviceID    = AdapterID.DeviceId;
+			pStatistics->HardwareDecoderInfo.SubSystemID = AdapterID.SubSysId;
+			pStatistics->HardwareDecoderInfo.Revision    = AdapterID.Revision;
 		} else {
-			::ZeroMemory(&pStatistics->DXVADeviceInfo, sizeof(pStatistics->DXVADeviceInfo));
+			const CMpeg2DecoderD3D11 *pD3D11Decoder = dynamic_cast<const CMpeg2DecoderD3D11 *>(m_pDecoder);
+			if (pD3D11Decoder) {
+				const DXGI_ADAPTER_DESC &AdapterDesc = pD3D11Decoder->GetAdapterDesc();
+				::lstrcpyW(pStatistics->HardwareDecoderInfo.Description, AdapterDesc.Description);
+				pStatistics->HardwareDecoderInfo.VendorID    = AdapterDesc.VendorId;
+				pStatistics->HardwareDecoderInfo.DeviceID    = AdapterDesc.DeviceId;
+				pStatistics->HardwareDecoderInfo.SubSystemID = AdapterDesc.SubSysId;
+				pStatistics->HardwareDecoderInfo.Revision    = AdapterDesc.Revision;
+			}
 		}
 	}
 
@@ -1444,6 +1594,38 @@ STDMETHODIMP CTVTestVideoDecoder::SetFrameCapture(ITVTestVideoDecoderFrameCaptur
 	CAutoLock Lock(&m_csReceive);
 
 	return m_FrameCapture.SetFrameCapture(pFrameCapture, MEDIASUBTYPE_I420);
+}
+
+STDMETHODIMP CTVTestVideoDecoder::SetEnableD3D11(BOOL fEnable)
+{
+	if (!IsWindows8OrGreater())
+		return HRESULT_FROM_WIN32(ERROR_OLD_WIN_VERSION);
+
+	CAutoLock Lock(&m_csProps);
+	DBG_TRACE(TEXT("SetEnableD3D11() : %d"), fEnable);
+	m_fD3D11Decode = fEnable != FALSE;
+	return S_OK;
+}
+
+STDMETHODIMP_(BOOL) CTVTestVideoDecoder::GetEnableD3D11()
+{
+	return m_fD3D11Decode;
+}
+
+STDMETHODIMP CTVTestVideoDecoder::SetNumQueueFrames(UINT NumFrames)
+{
+	if (NumFrames > CMpeg2DecoderD3D11::MAX_QUEUE_FRAMES)
+		return E_INVALIDARG;
+
+	CAutoLock Lock(&m_csProps);
+	DBG_TRACE(TEXT("SetNumQueueFrames() : %u"), NumFrames);
+	m_NumQueueFrames = NumFrames;
+	return S_OK;
+}
+
+STDMETHODIMP_(UINT) CTVTestVideoDecoder::GetNumQueueFrames()
+{
+	return m_NumQueueFrames;
 }
 
 

@@ -1,6 +1,6 @@
 /*
  *  TVTest DTV Video Decoder
- *  Copyright (C) 2015-2018 DBCTRADO
+ *  Copyright (C) 2015-2022 DBCTRADO
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -30,7 +30,6 @@
 
 CTVTestVideoDecoderStat::CTVTestVideoDecoderStat(LPUNKNOWN lpunk, HRESULT *phr)
 	: CBasePropertyPage(L"TVTestVideoDecoderStat", lpunk, IDD_STAT, IDS_STAT_TITLE)
-	, m_pDecoder(nullptr)
 {
 	if (phr)
 		*phr = S_OK;
@@ -38,8 +37,6 @@ CTVTestVideoDecoderStat::CTVTestVideoDecoderStat(LPUNKNOWN lpunk, HRESULT *phr)
 
 CTVTestVideoDecoderStat::~CTVTestVideoDecoderStat()
 {
-	if (m_pDecoder != nullptr)
-		m_pDecoder->Release();
 }
 
 CUnknown * CALLBACK CTVTestVideoDecoderStat::CreateInstance(LPUNKNOWN punk, HRESULT *phr)
@@ -63,32 +60,32 @@ HRESULT CTVTestVideoDecoderStat::OnConnect(IUnknown *pUnknown)
 {
 	if (pUnknown == nullptr)
 		return E_POINTER;
-	if (m_pDecoder != nullptr)
+	if (m_Decoder)
 		return E_UNEXPECTED;
 
 	ITVTestVideoDecoder *pDecoder;
 	HRESULT hr = pUnknown->QueryInterface(IID_PPV_ARGS(&pDecoder));
 	if (SUCCEEDED(hr))
-		m_pDecoder = pDecoder;
+		m_Decoder.Attach(pDecoder);
 
 	return hr;
 }
 
 HRESULT CTVTestVideoDecoderStat::OnDisconnect()
 {
-	SafeRelease(m_pDecoder);
+	m_Decoder.Release();
 
 	return S_OK;
 }
 
 HRESULT CTVTestVideoDecoderStat::OnActivate()
 {
-	if (m_pDecoder == nullptr)
+	if (!m_Decoder)
 		return E_UNEXPECTED;
 
 	::ZeroMemory(&m_Stat, sizeof(m_Stat));
 	m_Stat.Mask = TVTVIDEODEC_STAT_ALL;
-	m_pDecoder->GetStatistics(&m_Stat);
+	m_Decoder->GetStatistics(&m_Stat);
 
 	UpdateOutSize(m_Stat);
 	::SetDlgItemInt(m_Dlg, IDC_STAT_I_FRAME_COUNT, m_Stat.IFrameCount, FALSE);
@@ -99,12 +96,15 @@ HRESULT CTVTestVideoDecoderStat::OnActivate()
 	UpdatePlaybackRate(m_Stat.PlaybackRate);
 	UpdateBaseFPS(m_Stat.BaseTimePerFrame);
 	UpdateMode(m_Stat.Mode);
-	UpdateDXVADeviceDescription(m_Stat.DXVADeviceInfo.Description);
+	UpdateDecoderDeviceDescription(m_Stat.HardwareDecoderInfo.Description);
 
 	::SetDlgItemTextW(m_Dlg, IDC_STAT_VERSION,
 					  TVTVIDEODEC_FILTER_NAME L" ver." LTEXT(TVTVIDEODEC_VERSION_TEXT)
 #ifdef TVTVIDEODEC_VERSION_STATUS
 					  L"-" LTEXT(TVTVIDEODEC_VERSION_STATUS)
+#endif
+#ifdef TVTVIDEODEC_VERSION_HASH
+					  L" (" LTEXT(TVTVIDEODEC_VERSION_HASH) L")"
 #endif
 					  );
 
@@ -122,11 +122,11 @@ INT_PTR CTVTestVideoDecoderStat::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM w
 {
 	switch (uMsg) {
 	case WM_TIMER:
-		if (m_pDecoder) {
+		if (m_Decoder) {
 			TVTVIDEODEC_Statistics Stat = {};
 
 			Stat.Mask = TVTVIDEODEC_STAT_ALL;
-			m_pDecoder->GetStatistics(&Stat);
+			m_Decoder->GetStatistics(&Stat);
 
 			if (Stat.OutWidth != m_Stat.OutWidth
 					|| Stat.OutHeight != m_Stat.OutHeight
@@ -149,8 +149,8 @@ INT_PTR CTVTestVideoDecoderStat::OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM w
 				UpdateBaseFPS(Stat.BaseTimePerFrame);
 			if (Stat.Mode != m_Stat.Mode)
 				UpdateMode(Stat.Mode);
-			if (::lstrcmp(Stat.DXVADeviceInfo.Description, m_Stat.DXVADeviceInfo.Description) != 0)
-				UpdateDXVADeviceDescription(m_Stat.DXVADeviceInfo.Description);
+			if (::lstrcmp(Stat.HardwareDecoderInfo.Description, m_Stat.HardwareDecoderInfo.Description) != 0)
+				UpdateDecoderDeviceDescription(m_Stat.HardwareDecoderInfo.Description);
 
 			m_Stat = Stat;
 		}
@@ -189,13 +189,16 @@ void CTVTestVideoDecoderStat::UpdateBaseFPS(LONGLONG BaseTimePerFrame)
 
 void CTVTestVideoDecoderStat::UpdateMode(DWORD Mode)
 {
-	::SetDlgItemText(m_Dlg, IDC_STAT_MODE,
-					 (Mode & TVTVIDEODEC_MODE_DXVA2) ? TEXT("DXVA2") : TEXT("Software"));
+	::SetDlgItemText(
+		m_Dlg, IDC_STAT_MODE,
+		(Mode & TVTVIDEODEC_MODE_DXVA2) ? TEXT("DXVA2") :
+		(Mode & TVTVIDEODEC_MODE_D3D11) ? TEXT("D3D11") :
+		TEXT("Software"));
 }
 
-void CTVTestVideoDecoderStat::UpdateDXVADeviceDescription(LPCWSTR pszDescription)
+void CTVTestVideoDecoderStat::UpdateDecoderDeviceDescription(LPCWSTR pszDescription)
 {
-	::SetDlgItemText(m_Dlg, IDC_STAT_DXVA_DEVICE_DESCRIPTION, pszDescription);
+	::SetDlgItemText(m_Dlg, IDC_STAT_HARDWARE_DECODER_DESCRIPTION, pszDescription);
 }
 
 void CTVTestVideoDecoderStat::MakeDirty()

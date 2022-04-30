@@ -1,6 +1,6 @@
 /*
  *  TVTest DTV Video Decoder
- *  Copyright (C) 2015-2018 DBCTRADO
+ *  Copyright (C) 2015-2022 DBCTRADO
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -23,6 +23,7 @@
 #include "BaseVideoFilter.h"
 #include "PixelFormatConvert.h"
 #include "DXVA2Allocator.h"
+#include "D3D11Allocator.h"
 #include "Util.h"
 #include "MediaTypes.h"
 
@@ -33,9 +34,7 @@ CBaseVideoFilter::CBaseVideoFilter(PCWSTR pName, LPUNKNOWN lpunk, HRESULT *phr, 
 	: CTransformFilter(pName, lpunk, clsid)
 	, m_cBuffers(cBuffers)
 
-	, m_pD3DDeviceManager(nullptr)
 	, m_hDXVADevice(nullptr)
-	, m_pDXVA2Allocator(nullptr)
 	, m_fDXVAConnect(false)
 	, m_fDXVAOutput(false)
 	, m_fAttachMediaType(false)
@@ -64,7 +63,7 @@ CBaseVideoFilter::CBaseVideoFilter(PCWSTR pName, LPUNKNOWN lpunk, HRESULT *phr, 
 
 CBaseVideoFilter::~CBaseVideoFilter()
 {
-	SafeRelease(m_pDXVA2Allocator);
+	FreeAllocator();
 	CloseDXVA2DeviceManager();
 }
 
@@ -303,9 +302,9 @@ HRESULT CBaseVideoFilter::ReconnectOutput(
 		hr = m_pOutput->SetMediaType(&mt);
 		m_fAttachMediaType = true;
 
-		if (m_pDXVA2Allocator
-				&& (GetAlignedWidth() > m_pDXVA2Allocator->GetSurfaceWidth()
-				    || GetAlignedHeight() > m_pDXVA2Allocator->GetSurfaceHeight()))
+		if (m_DXVA2Allocator
+				&& (GetAlignedWidth() > m_DXVA2Allocator->GetSurfaceWidth()
+				    || GetAlignedHeight() > m_DXVA2Allocator->GetSurfaceHeight()))
 			RecommitAllocator();
 	} else {
 		int RetryTimeout = 100;
@@ -371,38 +370,46 @@ HRESULT CBaseVideoFilter::InitAllocator(IMemAllocator **ppAllocator)
 
 	if (m_fDXVAOutput) {
 		DBG_TRACE(TEXT("Create DXVA2 Allocator"));
-		SafeRelease(m_pDXVA2Allocator);
+		FreeAllocator();
 		HRESULT hr = S_OK;
-		m_pDXVA2Allocator = DNew_nothrow CDXVA2Allocator(this, &hr);
-		if (!m_pDXVA2Allocator) {
+		CDXVA2Allocator *pDXVA2Allocator = DNew_nothrow CDXVA2Allocator(this, &hr);
+		if (!pDXVA2Allocator) {
 			return E_OUTOFMEMORY;
 		}
 		if (FAILED(hr)) {
-			SafeDelete(m_pDXVA2Allocator);
+			delete pDXVA2Allocator;
 			return hr;
 		}
-		m_pDXVA2Allocator->AddRef();
+		m_DXVA2Allocator = pDXVA2Allocator;
 
-		return m_pDXVA2Allocator->QueryInterface(IID_PPV_ARGS(ppAllocator));
+		return m_DXVA2Allocator->QueryInterface(IID_PPV_ARGS(ppAllocator));
 	}
 
 	return E_NOTIMPL;
+}
+
+void CBaseVideoFilter::FreeAllocator()
+{
+	if (m_DXVA2Allocator) {
+		m_DXVA2Allocator->Decommit();
+		m_DXVA2Allocator.Release();
+	}
 }
 
 HRESULT CBaseVideoFilter::RecommitAllocator()
 {
 	HRESULT hr = S_OK;
 
-	if (m_pDXVA2Allocator) {
+	if (m_DXVA2Allocator) {
 		DBG_TRACE(TEXT("Recommit DXVA2 Allocator"));
 		OnDXVA2AllocatorDecommit();
-		m_pDXVA2Allocator->Decommit();
-		if (m_pDXVA2Allocator->IsDecommitInProgress()) {
+		m_DXVA2Allocator->Decommit();
+		if (m_DXVA2Allocator->IsDecommitInProgress()) {
 			m_pOutput->GetConnected()->BeginFlush();
 			m_pOutput->GetConnected()->EndFlush();
 		}
-		if (m_pD3DDeviceManager && m_hDXVADevice) {
-			hr = m_pDXVA2Allocator->Commit();
+		if (m_D3D9DeviceManager && m_hDXVADevice) {
+			hr = m_DXVA2Allocator->Commit();
 		}
 	}
 
@@ -412,15 +419,15 @@ HRESULT CBaseVideoFilter::RecommitAllocator()
 void CBaseVideoFilter::CloseDXVA2DeviceManager()
 {
 	CloseDXVA2DeviceHandle();
-	SafeRelease(m_pD3DDeviceManager);
+	m_D3D9DeviceManager.Release();
 }
 
 void CBaseVideoFilter::CloseDXVA2DeviceHandle()
 {
 	if (m_hDXVADevice != nullptr) {
 		DBG_TRACE(TEXT("Close DXVA2 device handle"));
-		_ASSERT(m_pD3DDeviceManager != nullptr);
-		m_pD3DDeviceManager->CloseDeviceHandle(m_hDXVADevice);
+		_ASSERT(m_D3D9DeviceManager);
+		m_D3D9DeviceManager->CloseDeviceHandle(m_hDXVADevice);
 		m_hDXVADevice = nullptr;
 	}
 }
@@ -440,9 +447,9 @@ HRESULT CBaseVideoFilter::ConfigureDXVA2(IPin *pPin)
 	hr = pGetService->GetService(MR_VIDEO_ACCELERATION_SERVICE, IID_PPV_ARGS(&pDeviceManager));
 	if (SUCCEEDED(hr)) {
 		HANDLE hDevice;
-		m_pD3DDeviceManager = pDeviceManager;
+		m_D3D9DeviceManager.Attach(pDeviceManager);
 
-		hr = m_pD3DDeviceManager->OpenDeviceHandle(&hDevice);
+		hr = m_D3D9DeviceManager->OpenDeviceHandle(&hDevice);
 		if (SUCCEEDED(hr)) {
 			m_hDXVADevice = hDevice;
 
@@ -846,21 +853,12 @@ HRESULT CBaseVideoFilter::CompleteConnect(PIN_DIRECTION direction, IPin *pReceiv
 
 int CBaseVideoFilter::GetAlignedWidth() const
 {
-	/*
-		NOTE: from ffmpeg
-		decoding MPEG-2 requires additional alignment on some Intel GPUs,
-		but it causes issues for H.264 on certain AMD GPUs.....
-	*/
-	// int Align = is_mpeg2 ? 32 : 16;
-	int Align = 32;
-	return (m_Dimensions.Width + (Align - 1)) & ~(Align - 1);
+	return GetDXVASurfaceSize(SIZE{m_Dimensions.Width, m_Dimensions.Height}, true).cx;
 }
 
 int CBaseVideoFilter::GetAlignedHeight() const
 {
-	// int Align = is_mpeg2 ? 32 : 16;
-	int Align = 32;
-	return (m_Dimensions.Height + (Align - 1)) & ~(Align - 1);
+	return GetDXVASurfaceSize(SIZE{m_Dimensions.Width, m_Dimensions.Height}, true).cy;
 }
 
 

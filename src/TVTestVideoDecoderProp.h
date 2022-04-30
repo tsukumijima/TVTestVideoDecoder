@@ -1,6 +1,6 @@
 /*
  *  TVTest DTV Video Decoder
- *  Copyright (C) 2015-2018 DBCTRADO
+ *  Copyright (C) 2015-2022 DBCTRADO
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
 
 
 #include "ITVTestVideoDecoder.h"
+#include "COMUtil.h"
 
 
 class __declspec(uuid("9AAE9F7C-6B57-4399-A914-605559F1686A")) CTVTestVideoDecoderProp
@@ -57,9 +58,16 @@ private:
 		int Saturation;
 		int NumThreads;
 		bool fEnableDXVA2;
+		bool fEnableD3D11;
 	};
 
-	ITVTestVideoDecoder *m_pDecoder;
+	enum {
+		DECODER_SOFTWARE,
+		DECODER_DXVA2,
+		DECODER_D3D11
+	};
+
+	COMPointer<ITVTestVideoDecoder> m_Decoder;
 	Settings m_OldSettings;
 	Settings m_NewSettings;
 	bool m_fInitialized;

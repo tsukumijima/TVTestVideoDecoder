@@ -1,6 +1,6 @@
 /*
  *  TVTest DTV Video Decoder
- *  Copyright (C) 2015-2018 DBCTRADO
+ *  Copyright (C) 2015-2022 DBCTRADO
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -20,6 +20,7 @@
 
 
 #include "ITVTestVideoDecoder.h"
+#include "COMUtil.h"
 
 
 class __declspec(uuid("48749A3E-2680-4833-93AF-8B93914B376F")) CTVTestVideoDecoderStat
@@ -44,7 +45,7 @@ public:
 	INT_PTR OnReceiveMessage(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) override;
 
 private:
-	ITVTestVideoDecoder *m_pDecoder;
+	COMPointer<ITVTestVideoDecoder> m_Decoder;
 	TVTVIDEODEC_Statistics m_Stat;
 
 	~CTVTestVideoDecoderStat();
@@ -54,5 +55,5 @@ private:
 	void UpdatePlaybackRate(LONG PlaybackRate);
 	void UpdateBaseFPS(LONGLONG BaseTimePerFrame);
 	void UpdateMode(DWORD Mode);
-	void UpdateDXVADeviceDescription(LPCWSTR pszDescription);
+	void UpdateDecoderDeviceDescription(LPCWSTR pszDescription);
 };
